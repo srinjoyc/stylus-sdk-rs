@@ -1,5 +1,5 @@
 [workspace]
-members = ["stylus-sdk", "stylus-proc"]
+members = ["stylus-sdk", "stylus-proc", "stylus-replay"]
 resolver = "2"
 
 [workspace.package]
@@ -32,6 +32,13 @@ regex = "1.9.1"
 proc-macro2 = "1.0"
 syn-solidity = "=0.3.1"
 convert_case = "0.6.0"
+
+# tooling only
+ethers = "2.0.10"
+eyre = "0.6.8"
+serde = "1.0.188"
+clap = { version = "4.4.5", features = ["derive"] }
+tokio = { version = "1.32.0", features = ["macros", "rt-multi-thread"] }
 
 # members
 stylus-sdk = { path = "stylus-sdk" }

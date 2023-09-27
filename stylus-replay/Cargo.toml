@@ -1,0 +1,22 @@
+[package]
+name = "stylus-replay"
+keywords = ["arbitrum", "ethereum", "stylus", "alloy"]
+description = "Replay transactions on arbitrum chains"
+readme = "../README.md"
+
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alloy-primitives = { version = "0.3.3", features = ["serde"] }
+clap.workspace = true
+eyre.workspace = true
+hex.workspace = true
+serde.workspace = true
+ethers.workspace = true
+tokio.workspace = true
