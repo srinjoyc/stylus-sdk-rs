@@ -1,61 +1,82 @@
 // Copyright 2023, Offchain Labs, Inc.
 // For licensing, see https://github.com/OffchainLabs/stylus-sdk-rs/blob/stylus/licenses/COPYRIGHT.md
 
+#![allow(clippy::redundant_closure_call)]
+
 use alloy_primitives::{Address, TxHash, B256, U256};
 use ethers::{
-    providers::{Http, JsonRpcClient, Middleware, Provider},
-    types::{GethDebugTracerType, GethDebugTracingOptions, GethTrace},
+    providers::{JsonRpcClient, Middleware, Provider},
+    types::{
+        GethDebugTracerType, GethDebugTracingOptions, GethTrace, Transaction, TransactionReceipt,
+    },
     utils::__serde_json::Value,
 };
 use eyre::{bail, Result};
-use std::mem;
+use std::{collections::VecDeque, mem};
 
 #[derive(Debug)]
 pub struct Trace {
-    values: Vec<()>,
-    status: TxStatus,
+    top_frame: TraceFrame,
+    pub receipt: TransactionReceipt,
+    pub tx: Transaction,
 }
 
 impl Trace {
     pub async fn new<T: JsonRpcClient>(provider: Provider<T>, tx: TxHash) -> Result<Self> {
-        let tx = tx.0.into();
+        let hash = tx.0.into();
+
+        let Some(receipt) = provider.get_transaction_receipt(hash).await? else {
+            bail!("failed to get receipt for tx: {}", hash)
+        };
+        let Some(tx) = provider.get_transaction(hash).await? else {
+            bail!("failed to get tx data: {}", hash)
+        };
 
         let query = include_str!("query.js");
         let tracer = GethDebugTracingOptions {
             tracer: Some(GethDebugTracerType::JsTracer(query.to_owned())),
             ..GethDebugTracingOptions::default()
         };
-        let GethTrace::Unknown(trace) = provider.debug_trace_transaction(tx, tracer).await? else {
+        let GethTrace::Unknown(trace) = provider.debug_trace_transaction(hash, tracer).await?
+        else {
             bail!("malformed tracing result")
         };
 
         println!("{}", trace);
-        println!("{:#?}", TraceFrame::parse_frame(Address::ZERO, trace));
 
-        todo!()
+        let to = receipt.to.map(|x| Address::from(x.0));
+        let top_frame = TraceFrame::parse_frame(to, trace)?;
+
+        println!("{:#?}", top_frame);
+
+        Ok(Self {
+            top_frame,
+            receipt,
+            tx,
+        })
+    }
+
+    pub fn reader(self) -> FrameReader {
+        FrameReader {
+            steps: self.top_frame.steps.clone().into(),
+            frame: self.top_frame,
+        }
     }
 }
 
-#[derive(Debug)]
-pub enum TxStatus {
-    Success,
-    Revert,
-    OutOfGas,
-}
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TraceFrame {
     steps: Vec<Hostio>,
-    address: Address,
+    address: Option<Address>,
 }
 
 impl TraceFrame {
-    fn new(address: Address) -> Self {
+    fn new(address: Option<Address>) -> Self {
         let steps = vec![];
         Self { steps, address }
     }
 
-    pub fn parse_frame(address: Address, array: Value) -> Result<TraceFrame> {
+    pub fn parse_frame(address: Option<Address>, array: Value) -> Result<TraceFrame> {
         let mut frame = TraceFrame::new(address);
 
         let Value::Array(array) = array else {
@@ -130,8 +151,8 @@ impl TraceFrame {
                 x.try_into().unwrap()
             ));
             convert!(to_u256, U256, |x| B256::from_slice(x).into());
-            convert!(to_b256, B256, |x| B256::from_slice(x));
-            convert!(to_address, Address, |x| Address::from_slice(x));
+            convert!(to_b256, B256, B256::from_slice);
+            convert!(to_address, Address, Address::from_slice);
 
             macro_rules! frame {
                 () => {{
@@ -144,7 +165,8 @@ impl TraceFrame {
                     let address: Vec<_> = address.into_iter().map(|x| x.1).collect();
 
                     let steps = info.remove("steps").unwrap();
-                    TraceFrame::parse_frame(to_address(&address)?, steps)?
+                    let to = Some(to_address(&address)?);
+                    TraceFrame::parse_frame(to, steps)?
                 }};
             }
 
@@ -184,19 +206,18 @@ impl TraceFrame {
                 end_ink,
             });
         }
-
         Ok(frame)
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Hostio {
-    kind: HostioKind,
+    pub kind: HostioKind,
     start_ink: u64,
     end_ink: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum HostioKind {
     ReadArgs {
         args: Box<[u8]>,
@@ -224,4 +245,52 @@ pub enum HostioKind {
     },
     UserEntrypoint,
     UserReturned,
+}
+
+impl HostioKind {
+    fn name(&self) -> &'static str {
+        use HostioKind as H;
+        match self {
+            H::ReadArgs { .. } => "read_args",
+            H::WriteResult { .. } => "write_result",
+            H::MsgValue { .. } => "msg_value",
+            H::MemoryGrow { .. } => "memory_grow",
+            H::ContractAddress { .. } => "contract_address",
+            H::CallContract { .. } => "call_contract",
+            H::UserEntrypoint => "user_entrypoint",
+            H::UserReturned => "user_returned",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FrameReader {
+    frame: TraceFrame,
+    steps: VecDeque<Hostio>,
+}
+
+impl FrameReader {
+    fn next(&mut self) -> Result<Hostio> {
+        match self.steps.pop_front() {
+            Some(item) => Ok(item),
+            None => bail!("No next hostio"),
+        }
+    }
+
+    pub fn next_hostio(&mut self, expected: &'static str) -> Hostio {
+        // TODO: the stable compiler's borrow checker can't see that self.next() is bound to
+        // the same lifetime, but when it can, refactor this loop.
+        loop {
+            let hostio = self.next().unwrap();
+            println!("Expect: {expected} {hostio:?}");
+
+            if hostio.kind.name() == expected {
+                return hostio;
+            }
+            match hostio.kind.name() {
+                "memory_grow" | "user_entrypoint" => continue,
+                _ => panic!("incorrect hostio:\nexpected {expected}\nfound {hostio:?}"),
+            }
+        }
+    }
 }

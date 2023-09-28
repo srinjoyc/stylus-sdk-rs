@@ -16,7 +16,13 @@ rust-version.workspace = true
 alloy-primitives = { version = "0.3.3", features = ["serde"] }
 clap.workspace = true
 eyre.workspace = true
-hex.workspace = true
-serde.workspace = true
 ethers.workspace = true
+function_name.workspace = true
+hex.workspace = true
+lazy_static.workspace = true
+libc.workspace = true
+libloading.workspace = true
+parking_lot.workspace = true
+rustc-host.workspace = true
+serde.workspace = true
 tokio.workspace = true

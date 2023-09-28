@@ -30,4 +30,11 @@ lto = true
 panic = "abort"
 opt-level = "s"
 
+[[bin]]
+name = "stylus-hello-world"
+path = "src/main.rs"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [workspace]

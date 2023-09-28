@@ -3,11 +3,39 @@
 
 #![allow(unused)]
 
+use crate::trace::{FrameReader, HostioKind::*};
+use function_name::named;
+use lazy_static::lazy_static;
+use parking_lot::Mutex;
+use std::{mem, ptr::copy_nonoverlapping as memcpy};
+
+lazy_static! {
+    pub static ref FRAME: Mutex<Option<FrameReader>> = Mutex::new(None);
+    pub static ref INK_LEFT: Mutex<u64> = Mutex::new(0);
+}
+
+macro_rules! frame {
+    ($dec:pat) => {
+        let $dec = FRAME
+            .lock()
+            .as_mut()
+            .unwrap()
+            .next_hostio(function_name!())
+            .kind
+        else {
+            unreachable!()
+        };
+    };
+}
+
 /// Gets the ETH balance in wei of the account at the given address.
 /// The semantics are equivalent to that of the EVM's [`BALANCE`] opcode.
 ///
 /// [`BALANCE`]: https://www.evm.codes/#31
-pub fn account_balance(address: *const u8, dest: *mut u8) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn account_balance(address: *const u8, dest: *mut u8) {
+    //let hostio = frame!();
     todo!()
 }
 
@@ -17,7 +45,9 @@ pub fn account_balance(address: *const u8, dest: *mut u8) {
 /// `keccak("") = c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`.
 ///
 /// [`EXT_CODEHASH`]: https://www.evm.codes/#3F
-pub fn account_codehash(address: *const u8, dest: *mut u8) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn account_codehash(address: *const u8, dest: *mut u8) {
     todo!()
 }
 
@@ -27,7 +57,9 @@ pub fn account_codehash(address: *const u8, dest: *mut u8) {
 /// set. The semantics, then, are equivalent to that of the EVM's [`SLOAD`] opcode.
 ///
 /// [`SLOAD`]: https://www.evm.codes/#54
-pub fn storage_load_bytes32(key: *const u8, dest: *mut u8) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn storage_load_bytes32(key: *const u8, dest: *mut u8) {
     todo!()
 }
 
@@ -37,7 +69,9 @@ pub fn storage_load_bytes32(key: *const u8, dest: *mut u8) {
 /// EVM. The semantics, then, are equivalent to that of the EVM's [`SSTORE`] opcode.
 ///
 /// [`SSTORE`]: https://www.evm.codes/#55
-pub fn storage_store_bytes32(key: *const u8, value: *const u8) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn storage_store_bytes32(key: *const u8, value: *const u8) {
     todo!()
 }
 
@@ -45,22 +79,18 @@ pub fn storage_store_bytes32(key: *const u8, value: *const u8) {
 /// [`BASEFEE`] opcode.
 ///
 /// [`BASEFEE`]: https://www.evm.codes/#48
-pub fn block_basefee(basefee: *mut u8) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn block_basefee(basefee: *mut u8) {
     todo!()
-}
-
-/// Gets the unique chain identifier of the Arbitrum chain. The semantics are equivalent to
-/// that of the EVM's [`CHAIN_ID`] opcode.
-///
-/// [`CHAIN_ID`]: https://www.evm.codes/#46
-pub fn chainid() -> u64 {
-    23011913
 }
 
 /// Gets the coinbase of the current block, which on Arbitrum chains is the L1 batch poster's
 /// address. This differs from Ethereum where the validator including the transaction
 /// determines the coinbase.
-pub fn block_coinbase(coinbase: *mut u8) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn block_coinbase(coinbase: *mut u8) {
     todo!()
 }
 
@@ -71,7 +101,9 @@ pub fn block_coinbase(coinbase: *mut u8) {
 ///
 /// [`GAS_LIMIT`]: https://www.evm.codes/#45
 /// [`The Ethereum Yellow Paper`]: https://ethereum.github.io/yellowpaper/paper.pdf
-pub fn block_gas_limit() -> u64 {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn block_gas_limit() -> u64 {
     todo!()
 }
 
@@ -80,7 +112,9 @@ pub fn block_gas_limit() -> u64 {
 /// determined.
 ///
 /// [`Block Numbers and Time`]: https://developer.arbitrum.io/time
-pub fn block_number() -> u64 {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn block_number() -> u64 {
     todo!()
 }
 
@@ -89,8 +123,20 @@ pub fn block_number() -> u64 {
 /// determined.
 ///
 /// [`Block Numbers and Time`]: https://developer.arbitrum.io/time
-pub fn block_timestamp() -> u64 {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn block_timestamp() -> u64 {
     todo!()
+}
+
+/// Gets the unique chain identifier of the Arbitrum chain. The semantics are equivalent to
+/// that of the EVM's [`CHAIN_ID`] opcode.
+///
+/// [`CHAIN_ID`]: https://www.evm.codes/#46
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn chainid() -> u64 {
+    23011913
 }
 
 /// Calls the contract at the given address with options for passing value and to limit the
@@ -107,7 +153,9 @@ pub fn block_timestamp() -> u64 {
 /// to send as much as possible.
 ///
 /// [`CALL`]: https://www.evm.codes/#f1
-pub fn call_contract(
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn call_contract(
     contract: *const u8,
     calldata: *const u8,
     calldata_len: usize,
@@ -115,15 +163,28 @@ pub fn call_contract(
     gas: u64,
     return_data_len: *mut usize,
 ) -> u8 {
-    todo!()
+    frame!(CallContract {
+        address,
+        data,
+        gas,
+        value,
+        outs_len,
+        status,
+        frame,
+    });
+    //memcpy(address.as_ptr(), dest, mem::size_of_val(address))
+    status
 }
 
 /// Gets the address of the current program. The semantics are equivalent to that of the EVM's
 /// [`ADDRESS`] opcode.
 ///
 /// [`ADDRESS`]: https://www.evm.codes/#30
-pub fn contract_address(address: *mut u8) {
-    todo!()
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn contract_address(dest: *mut u8) {
+    frame!(ContractAddress { address });
+    memcpy(address.as_ptr(), dest, mem::size_of_val(&address))
 }
 
 /// Deploys a new contract using the init code provided, which the EVM executes to construct
@@ -141,7 +202,9 @@ pub fn contract_address(address: *mut u8) {
 ///
 /// [`Deploying Stylus Programs`]: https://developer.arbitrum.io/TODO
 /// [`CREATE`]: https://www.evm.codes/#f0
-pub fn create1(
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn create1(
     code: *const u8,
     code_len: usize,
     endowment: *const u8,
@@ -166,7 +229,9 @@ pub fn create1(
 ///
 /// [`Deploying Stylus Programs`]: https://developer.arbitrum.io/TODO
 /// [`CREATE2`]: https://www.evm.codes/#f5
-pub fn create2(
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn create2(
     code: *const u8,
     code_len: usize,
     endowment: *const u8,
@@ -191,7 +256,9 @@ pub fn create2(
 /// possible.
 ///
 /// [`DELEGATE_CALL`]: https://www.evm.codes/#F4
-pub fn delegate_call_contract(
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn delegate_call_contract(
     contract: *const u8,
     calldata: *const u8,
     calldata_len: usize,
@@ -211,7 +278,9 @@ pub fn delegate_call_contract(
 /// [`LOG2`]: https://www.evm.codes/#a2
 /// [`LOG3`]: https://www.evm.codes/#a3
 /// [`LOG4`]: https://www.evm.codes/#a4
-pub fn emit_log(data: *const u8, len: usize, topics: usize) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn emit_log(data: *const u8, len: usize, topics: usize) {
     todo!()
 }
 
@@ -219,7 +288,9 @@ pub fn emit_log(data: *const u8, len: usize, topics: usize) {
 /// equivalent to that of the EVM's [`GAS`] opcode.
 ///
 /// [`GAS`]: https://www.evm.codes/#5a
-pub fn evm_gas_left() -> u64 {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn evm_gas_left() -> u64 {
     todo!()
 }
 
@@ -229,7 +300,9 @@ pub fn evm_gas_left() -> u64 {
 ///
 /// [`GAS`]: https://www.evm.codes/#5a
 /// [`Ink and Gas`]: https://developer.arbitrum.io/TODO
-pub fn evm_ink_left() -> u64 {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn evm_ink_left() -> u64 {
     todo!()
 }
 
@@ -237,12 +310,17 @@ pub fn evm_ink_left() -> u64 {
 /// program's memory grows. Otherwise compilation through the `ArbWasm` precompile will revert.
 /// Internally the Stylus VM forces calls to this hostio whenever new WASM pages are allocated.
 /// Calls made voluntarily will unproductively consume gas.
-pub fn memory_grow(pages: u16) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn memory_grow(pages: u16) {
+    //let hostio = frame!();
     todo!()
 }
 
 /// Whether the current call is reentrant.
-pub fn msg_reentrant() -> bool {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn msg_reentrant() -> bool {
     todo!()
 }
 
@@ -256,7 +334,9 @@ pub fn msg_reentrant() -> bool {
 /// [`CALLER`]: https://www.evm.codes/#33
 /// [`DELEGATE_CALL`]: https://www.evm.codes/#f4
 /// [`Retryable Ticket Address Aliasing`]: https://developer.arbitrum.io/arbos/l1-to-l2-messaging#address-aliasing
-pub fn msg_sender(sender: *mut u8) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn msg_sender(sender: *mut u8) {
     todo!()
 }
 
@@ -264,8 +344,11 @@ pub fn msg_sender(sender: *mut u8) {
 /// EVM's [`CALLVALUE`] opcode.
 ///
 /// [`CALLVALUE`]: https://www.evm.codes/#34
-pub fn msg_value(value: *mut u8) {
-    todo!()
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn msg_value(dest: *mut u8) {
+    frame!(MsgValue { value });
+    memcpy(value.as_ptr(), dest, mem::size_of_val(&value))
 }
 
 /// Efficiently computes the [`keccak256`] hash of the given preimage.
@@ -273,7 +356,9 @@ pub fn msg_value(value: *mut u8) {
 ///
 /// [`keccak256`]: https://en.wikipedia.org/wiki/SHA-3
 /// [`SHA3`]: https://www.evm.codes/#20
-pub fn native_keccak256(bytes: *const u8, len: usize, output: *mut u8) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn native_keccak256(bytes: *const u8, len: usize, output: *mut u8) {
     todo!()
 }
 
@@ -281,8 +366,11 @@ pub fn native_keccak256(bytes: *const u8, len: usize, output: *mut u8) {
 /// [`CALLDATA_COPY`] opcode when requesting the entirety of the current call's calldata.
 ///
 /// [`CALLDATA_COPY`]: https://www.evm.codes/#37
-pub fn read_args(dest: *mut u8) {
-    todo!()
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn read_args(dest: *mut u8) {
+    frame!(ReadArgs { args });
+    memcpy(args.as_ptr(), dest, args.len());
 }
 
 /// Copies the bytes of the last EVM call or deployment return result. Does not revert if out of
@@ -290,15 +378,19 @@ pub fn read_args(dest: *mut u8) {
 /// to that of the EVM's [`RETURN_DATA_COPY`] opcode.
 ///
 /// [`RETURN_DATA_COPY`]: https://www.evm.codes/#3e
-pub fn read_return_data(dest: *mut u8, offset: usize, size: usize) -> usize {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn read_return_data(dest: *mut u8, offset: usize, size: usize) -> usize {
     todo!()
 }
 
 /// Writes the final return data. If not called before the program exists, the return data will
 /// be 0 bytes long. Note that this hostio does not cause the program to exit, which happens
 /// naturally when `user_entrypoint` returns.
-pub fn write_result(data: *const u8, len: usize) {
-    todo!()
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn write_result(data: *const u8, len: usize) {
+    frame!(WriteResult { result });
 }
 
 /// Returns the length of the last EVM call or deployment return result, or `0` if neither have
@@ -306,7 +398,9 @@ pub fn write_result(data: *const u8, len: usize) {
 /// [`RETURN_DATA_SIZE`] opcode.
 ///
 /// [`RETURN_DATA_SIZE`]: https://www.evm.codes/#3d
-pub fn return_data_size() -> usize {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn return_data_size() -> usize {
     todo!()
 }
 
@@ -324,7 +418,9 @@ pub fn return_data_size() -> usize {
 /// possible.
 ///
 /// [`STATIC_CALL`]: https://www.evm.codes/#FA
-pub fn static_call_contract(
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn static_call_contract(
     contract: *const u8,
     calldata: *const u8,
     calldata_len: usize,
@@ -338,7 +434,9 @@ pub fn static_call_contract(
 /// semantics are equivalent to that of the EVM's [`GAS_PRICE`] opcode.
 ///
 /// [`GAS_PRICE`]: https://www.evm.codes/#3A
-pub fn tx_gas_price(gas_price: *mut u8) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn tx_gas_price(gas_price: *mut u8) {
     todo!()
 }
 
@@ -346,7 +444,9 @@ pub fn tx_gas_price(gas_price: *mut u8) {
 /// Stylus's compute-pricing model.
 ///
 /// [`Ink and Gas`]: https://developer.arbitrum.io/TODO
-pub fn tx_ink_price() -> u32 {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn tx_ink_price() -> u32 {
     todo!()
 }
 
@@ -354,35 +454,47 @@ pub fn tx_ink_price() -> u32 {
 /// EVM's [`ORIGIN`] opcode.
 ///
 /// [`ORIGIN`]: https://www.evm.codes/#32
-pub fn tx_origin(origin: *mut u8) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn tx_origin(origin: *mut u8) {
     todo!()
 }
 
 /// Prints a 32-bit floating point number to the console. Only available in debug mode with
 /// floating point enabled.
-pub fn log_f32(value: f32) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn log_f32(value: f32) {
     todo!()
 }
 
 /// Prints a 64-bit floating point number to the console. Only available in debug mode with
 /// floating point enabled.
-pub fn log_f64(value: f64) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn log_f64(value: f64) {
     todo!()
 }
 
 /// Prints a 32-bit integer to the console, which can be either signed or unsigned.
 /// Only available in debug mode.
-pub fn log_i32(value: i32) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn log_i32(value: i32) {
     todo!()
 }
 
 /// Prints a 64-bit integer to the console, which can be either signed or unsigned.
 /// Only available in debug mode.
-pub fn log_i64(value: i64) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn log_i64(value: i64) {
     todo!()
 }
 
 /// Prints a UTF-8 encoded string to the console. Only available in debug mode.
-pub fn log_txt(text: *const u8, len: usize) {
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn log_txt(text: *const u8, len: usize) {
     todo!()
 }
