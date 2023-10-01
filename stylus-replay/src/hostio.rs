@@ -219,7 +219,7 @@ pub unsafe extern "C" fn call_contract(
     assert_eq!(read_bytes(calldata, calldata_len), &*data);
     assert_eq!(read_fixed(value_ptr), value.to_be_bytes::<32>());
     assert_eq!(gas_supplied, gas);
-    *return_data_len = outs_len;
+    *return_data_len = outs_len as usize;
     status
 }
 
@@ -257,7 +257,7 @@ pub unsafe extern "C" fn delegate_call_contract(
     assert_eq!(read_fixed(address_ptr), address);
     assert_eq!(read_bytes(calldata, calldata_len), &*data);
     assert_eq!(gas_supplied, gas);
-    *return_data_len = outs_len;
+    *return_data_len = outs_len as usize;
     status
 }
 
@@ -295,7 +295,7 @@ pub unsafe extern "C" fn static_call_contract(
     assert_eq!(read_fixed(address_ptr), address);
     assert_eq!(read_bytes(calldata, calldata_len), &*data);
     assert_eq!(gas_supplied, gas);
-    *return_data_len = outs_len;
+    *return_data_len = outs_len as usize;
     status
 }
 

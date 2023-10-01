@@ -43,12 +43,8 @@ impl Trace {
             bail!("malformed tracing result")
         };
 
-        println!("{}", trace);
-
         let to = receipt.to.map(|x| Address::from(x.0));
         let top_frame = TraceFrame::parse_frame(to, trace)?;
-
-        println!("{:#?}", top_frame);
 
         Ok(Self {
             top_frame,
@@ -303,7 +299,7 @@ impl TraceFrame {
                     gas: read_u64!(args),
                     value: read_u256!(args),
                     data: read_data!(args),
-                    outs_len: read_usize!(outs),
+                    outs_len: read_u32!(outs),
                     status: read_u8!(outs),
                     frame: frame!(),
                 },
@@ -311,7 +307,7 @@ impl TraceFrame {
                     address: read_address!(args),
                     gas: read_u64!(args),
                     data: read_data!(args),
-                    outs_len: read_usize!(outs),
+                    outs_len: read_u32!(outs),
                     status: read_u8!(outs),
                     frame: frame!(),
                 },
@@ -319,7 +315,7 @@ impl TraceFrame {
                     address: read_address!(args),
                     gas: read_u64!(args),
                     data: read_data!(args),
-                    outs_len: read_usize!(outs),
+                    outs_len: read_u32!(outs),
                     status: read_u8!(outs),
                     frame: frame!(),
                 },
@@ -470,7 +466,7 @@ pub enum HostioKind {
         data: Box<[u8]>,
         gas: u64,
         value: U256,
-        outs_len: usize,
+        outs_len: u32,
         status: u8,
         frame: TraceFrame,
     },
@@ -478,7 +474,7 @@ pub enum HostioKind {
         address: Address,
         data: Box<[u8]>,
         gas: u64,
-        outs_len: usize,
+        outs_len: u32,
         status: u8,
         frame: TraceFrame,
     },
@@ -486,7 +482,7 @@ pub enum HostioKind {
         address: Address,
         data: Box<[u8]>,
         gas: u64,
-        outs_len: usize,
+        outs_len: u32,
         status: u8,
         frame: TraceFrame,
     },
@@ -532,26 +528,37 @@ impl FrameReader {
     }
 
     pub fn next_hostio(&mut self, expected: &'static str) -> Hostio {
-        // TODO: the stable compiler's borrow checker can't see that self.next() is bound to
-        // the same lifetime, but when it can, refactor this loop.
+        fn detected(reader: &FrameReader, expected: &'static str) {
+            let which = match reader.frame.address {
+                Some(call) => format!("call to {call}"),
+                None => "contract deployment".to_string(),
+            };
+            println!("\n════════ Divergence ════════");
+            println!("Divegence detected while simulating a {which} via local assembly.");
+            println!("The simulated environment expected a call to the {expected} Host I/O.");
+        }
+
         loop {
-            let hostio = self.next().unwrap();
-            println!("Expect: {expected} {hostio:?}");
+            let Ok(hostio) = self.next() else {
+                detected(self, expected);
+                println!("However, no such call is made onchain. Are you sure this the right contract?\n");
+                panic!();
+            };
 
             if hostio.kind.name() == expected {
                 return hostio;
             }
+
             let kind = hostio.kind;
-            match kind.name() {
-                "memory_grow" | "user_entrypoint" => continue,
+            let name = kind.name();
+            match name {
+                "memory_grow" | "user_entrypoint" | "user_returned" => continue,
                 _ => {
-                    for step in &self.frame.steps {
-                        println!("Step: {:#?}", step.kind);
-                    }
-                    panic!(
-                        "incorrect hostio:\n\texpected {expected}\n\tfound    {kind:?} {}\n",
-                        kind.name()
-                    )
+                    detected(self, expected);
+                    println!("However, onchain there's a call to {name}. Are you sure this the right contract?\n");
+                    println!("expected: {expected}");
+                    println!("but have: {kind:?}\n");
+                    panic!();
                 }
             }
         }

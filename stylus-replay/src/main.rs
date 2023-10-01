@@ -6,7 +6,7 @@ use alloy_primitives::{Address, TxHash};
 use clap::Parser;
 use ethers::providers::{Http, Provider};
 use eyre::{bail, Result};
-use std::path::PathBuf;
+use std::{os::unix::process::CommandExt, path::PathBuf};
 
 pub use hostio::*;
 
@@ -29,11 +29,32 @@ struct Args {
     /// Project path.
     #[arg(short, long, default_value = ".")]
     project: PathBuf,
+    /// Whether to use stable Rust. Note that nightly is needed to expand macros.
+    #[arg(short, long)]
+    stable_rust: bool,
+    #[arg(short, long, hide(true))]
+    child: bool,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let opts = Args::parse();
+
+    if !opts.child {
+        let mut cmd = util::new_command("rust-gdb");
+        cmd.arg("-ex=set breakpoint pending on");
+        cmd.arg("-ex=b user_entrypoint");
+        cmd.arg("-ex=r");
+        cmd.arg("--args");
+
+        for arg in std::env::args() {
+            cmd.arg(arg);
+        }
+        cmd.arg("--child");
+        let err = cmd.exec();
+
+        bail!("failed to exec gdb {}", err);
+    }
 
     let provider: Provider<Http> = match opts.endpoint.try_into() {
         Ok(provider) => provider,
@@ -42,7 +63,7 @@ async fn main() -> Result<()> {
 
     let trace = Trace::new(provider, opts.tx).await?;
 
-    util::build_so(&opts.project)?;
+    util::build_so(&opts.project, opts.stable_rust)?;
     let so = util::find_so(&opts.project)?;
 
     // TODO: don't assume the contract is top-level
@@ -54,8 +75,12 @@ async fn main() -> Result<()> {
         type Entrypoint = unsafe extern "C" fn(usize) -> usize;
         let lib = libloading::Library::new(so)?;
         let main: libloading::Symbol<Entrypoint> = lib.get(b"user_entrypoint")?;
-        let status = main(args_len);
-        println!("contract exited with status: {status}");
+
+        match main(args_len) {
+            0 => println!("call completed successfully"),
+            1 => println!("call reverted"),
+            x => println!("call exited with unknown status code: {x}"),
+        }
     }
     Ok(())
 }

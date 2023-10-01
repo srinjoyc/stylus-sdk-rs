@@ -8,14 +8,20 @@ use std::{
     process::{Command, Stdio},
 };
 
-fn new_command<S: AsRef<OsStr>>(program: S) -> Command {
+pub fn new_command<S: AsRef<OsStr>>(program: S) -> Command {
     let mut command = Command::new(program);
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     command
 }
 
-pub fn build_so(path: &Path) -> Result<()> {
-    new_command("cargo")
+pub fn build_so(path: &Path, stable: bool) -> Result<()> {
+    let mut cargo = new_command("cargo");
+
+    if !stable {
+        cargo.arg("+nightly");
+    }
+
+    cargo
         .current_dir(path)
         .arg("build")
         .arg("--lib")
