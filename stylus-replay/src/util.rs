@@ -2,7 +2,28 @@
 // For licensing, see https://github.com/OffchainLabs/stylus-sdk-rs/blob/stylus/licenses/COPYRIGHT.md
 
 use eyre::{bail, eyre, Result};
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
+
+fn new_command<S: AsRef<OsStr>>(program: S) -> Command {
+    let mut command = Command::new(program);
+    command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    command
+}
+
+pub fn build_so(path: &Path) -> Result<()> {
+    new_command("cargo")
+        .current_dir(path)
+        .arg("build")
+        .arg("--lib")
+        .arg("--target")
+        .arg(rustc_host::from_cli()?)
+        .output()?;
+    Ok(())
+}
 
 pub fn find_so(project: &Path) -> Result<PathBuf> {
     let triple = rustc_host::from_cli()?;

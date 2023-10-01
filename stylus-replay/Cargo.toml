@@ -25,4 +25,5 @@ libloading.workspace = true
 parking_lot.workspace = true
 rustc-host.workspace = true
 serde.workspace = true
+sneks.workspace = true
 tokio.workspace = true

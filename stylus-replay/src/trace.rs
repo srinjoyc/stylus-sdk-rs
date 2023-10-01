@@ -12,6 +12,7 @@ use ethers::{
     utils::__serde_json::Value,
 };
 use eyre::{bail, Result};
+use sneks::SimpleSnakeNames;
 use std::{collections::VecDeque, mem};
 
 #[derive(Debug)]
@@ -110,10 +111,13 @@ impl TraceFrame {
             let args = get_typed!(keys, Array, "args");
             let outs = get_typed!(keys, Array, "outs");
 
+            let mut args = args.as_slice();
+            let mut outs = outs.as_slice();
+
             let start_ink = get_int!("startInk");
             let end_ink = get_int!("endInk");
 
-            fn to_data(values: &[Value]) -> Result<Box<[u8]>> {
+            fn read_data(values: &[Value]) -> Result<Box<[u8]>> {
                 let mut vec = vec![];
                 for value in values {
                     let Value::Number(byte) = value else {
@@ -128,31 +132,73 @@ impl TraceFrame {
                 Ok(vec.into_boxed_slice())
             }
 
-            macro_rules! convert {
-                ($name:ident, $ty:ident, $conv:expr) => {
-                    fn $name(data: &[Value]) -> Result<$ty> {
-                        let data = to_data(data)?;
-                        if data.len() != mem::size_of::<$ty>() {
-                            bail!("expected {}: {}", stringify!($ty), hex::encode(data));
-                        }
-                        Ok($conv(&data[..]))
-                    }
+            macro_rules! read_data {
+                ($src:ident) => {{
+                    let data = read_data(&$src)?;
+                    $src = &[];
+                    data
+                }};
+            }
+            macro_rules! read_ty {
+                ($src:ident, $ty:ident, $conv:expr) => {{
+                    let size = mem::size_of::<$ty>();
+                    let data = read_data(&$src[..size])?;
+                    $src = &$src[size..];
+                    $conv(&data[..])
+                }};
+            }
+            macro_rules! read_string {
+                ($src:ident) => {{
+                    let conv = |x: &[_]| String::from_utf8_lossy(&x).to_string();
+                    read_ty!($src, String, conv)
+                }};
+            }
+            macro_rules! read_u256 {
+                ($src:ident) => {
+                    read_ty!($src, U256, |x| B256::from_slice(x).into())
                 };
             }
-
-            convert!(to_u8, u8, |x: &[_]| x[0]);
-            convert!(to_u16, u16, |x: &[_]| u16::from_be_bytes(
-                x.try_into().unwrap()
-            ));
-            convert!(to_u32, u32, |x: &[_]| u32::from_be_bytes(
-                x.try_into().unwrap()
-            ));
-            convert!(to_u64, u64, |x: &[_]| u64::from_be_bytes(
-                x.try_into().unwrap()
-            ));
-            convert!(to_u256, U256, |x| B256::from_slice(x).into());
-            convert!(to_b256, B256, B256::from_slice);
-            convert!(to_address, Address, Address::from_slice);
+            macro_rules! read_b256 {
+                ($src:ident) => {
+                    read_ty!($src, B256, B256::from_slice)
+                };
+            }
+            macro_rules! read_address {
+                ($src:ident) => {
+                    read_ty!($src, Address, Address::from_slice)
+                };
+            }
+            macro_rules! read_num {
+                ($src:ident, $ty:ident) => {{
+                    let conv = |x: &[_]| $ty::from_be_bytes(x.try_into().unwrap());
+                    read_ty!($src, $ty, conv)
+                }};
+            }
+            macro_rules! read_u8 {
+                ($src:ident) => {
+                    read_num!($src, u8)
+                };
+            }
+            macro_rules! read_u16 {
+                ($src:ident) => {
+                    read_num!($src, u16)
+                };
+            }
+            macro_rules! read_u32 {
+                ($src:ident) => {
+                    read_num!($src, u32)
+                };
+            }
+            macro_rules! read_u64 {
+                ($src:ident) => {
+                    read_num!($src, u64)
+                };
+            }
+            macro_rules! read_usize {
+                ($src:ident) => {
+                    read_num!($src, usize)
+                };
+            }
 
             macro_rules! frame {
                 () => {{
@@ -163,42 +209,156 @@ impl TraceFrame {
                     let mut address: Vec<_> = address.into_iter().collect();
                     address.sort_by_key(|x| x.0.parse::<u8>().unwrap());
                     let address: Vec<_> = address.into_iter().map(|x| x.1).collect();
+                    let address = Address::from_slice(&*read_data(&address)?);
 
                     let steps = info.remove("steps").unwrap();
-                    let to = Some(to_address(&address)?);
-                    TraceFrame::parse_frame(to, steps)?
+                    TraceFrame::parse_frame(Some(address), steps)?
                 }};
             }
 
             use HostioKind::*;
             let kind = match name.as_str() {
+                "user_entrypoint" => UserEntrypoint {
+                    args_len: read_u32!(args),
+                },
+                "user_returned" => UserReturned {
+                    status: read_u32!(outs),
+                },
                 "read_args" => ReadArgs {
-                    args: to_data(&outs)?,
+                    args: read_data!(outs),
                 },
                 "write_result" => WriteResult {
-                    result: to_data(&args)?,
+                    result: read_data!(args),
                 },
-                "msg_value" => MsgValue {
-                    value: to_b256(&outs)?,
+                "storage_load_bytes32" => StorageLoadBytes32 {
+                    key: read_b256!(args),
+                    value: read_b256!(outs),
                 },
-                "memory_grow" => MemoryGrow {
-                    pages: to_u16(&args)?,
+                "storage_store_bytes32" => StorageStoreBytes32 {
+                    key: read_b256!(args),
+                    value: read_b256!(args),
+                },
+                "account_balance" => AccountBalance {
+                    address: read_address!(args),
+                    balance: read_u256!(outs),
+                },
+                "account_codehash" => AccountCodehash {
+                    address: read_address!(args),
+                    codehash: read_b256!(outs),
+                },
+                "block_basefee" => BlockBasefee {
+                    basefee: read_u256!(outs),
+                },
+                "block_coinbase" => BlockCoinbase {
+                    coinbase: read_address!(outs),
+                },
+                "block_gas_limit" => BlockGasLimit {
+                    limit: read_u64!(outs),
+                },
+                "block_number" => BlockNumber {
+                    number: read_u64!(outs),
+                },
+                "block_timestamp" => BlockTimestamp {
+                    timestamp: read_u64!(outs),
+                },
+                "chainid" => Chainid {
+                    chainid: read_u64!(outs),
                 },
                 "contract_address" => ContractAddress {
-                    address: to_address(&outs)?,
+                    address: read_address!(outs),
+                },
+                "evm_gas_left" => EvmGasLeft {
+                    gas_left: read_u64!(outs),
+                },
+                "evm_ink_left" => EvmInkLeft {
+                    ink_left: read_u64!(outs),
+                },
+                "msg_reentrant" => MsgReentrant {
+                    reentrant: read_u32!(outs) != 0,
+                },
+                "msg_sender" => MsgSender {
+                    sender: read_address!(outs),
+                },
+                "msg_value" => MsgValue {
+                    value: read_b256!(outs),
+                },
+                "native_keccak256" => NativeKeccak256 {
+                    preimage: read_data!(args),
+                    digest: read_b256!(outs),
+                },
+                "tx_gas_price" => TxGasPrice {
+                    gas_price: read_u256!(outs),
+                },
+                "tx_ink_price" => TxInkPrice {
+                    ink_price: read_u32!(outs),
+                },
+                "tx_origin" => TxOrigin {
+                    origin: read_address!(outs),
+                },
+                "memory_grow" => MemoryGrow {
+                    pages: read_u16!(args),
                 },
                 "call_contract" => CallContract {
-                    address: to_address(&args[..20])?,
-                    gas: to_u64(&args[20..28])?,
-                    value: to_u256(&args[28..60])?,
-                    data: to_data(&args[60..])?,
-                    outs_len: to_u32(&outs[..4])?,
-                    status: to_u8(&outs[4..])?,
+                    address: read_address!(args),
+                    gas: read_u64!(args),
+                    value: read_u256!(args),
+                    data: read_data!(args),
+                    outs_len: read_usize!(outs),
+                    status: read_u8!(outs),
                     frame: frame!(),
                 },
-                "user_entrypoint" | "user_returned" => continue,
-                x => todo!("{}", x),
+                "delegate_call_contract" => DelegateCallContract {
+                    address: read_address!(args),
+                    gas: read_u64!(args),
+                    data: read_data!(args),
+                    outs_len: read_usize!(outs),
+                    status: read_u8!(outs),
+                    frame: frame!(),
+                },
+                "static_call_contract" => StaticCallContract {
+                    address: read_address!(args),
+                    gas: read_u64!(args),
+                    data: read_data!(args),
+                    outs_len: read_usize!(outs),
+                    status: read_u8!(outs),
+                    frame: frame!(),
+                },
+                "create1" => Create1 {
+                    endowment: read_u256!(args),
+                    code: read_data!(args),
+                    address: read_address!(outs),
+                    revert_data_len: read_usize!(outs),
+                },
+                "create2" => Create2 {
+                    endowment: read_u256!(args),
+                    salt: read_b256!(args),
+                    code: read_data!(args),
+                    address: read_address!(outs),
+                    revert_data_len: read_usize!(outs),
+                },
+                "emit_log" => EmitLog {
+                    topics: read_usize!(args),
+                    data: read_data!(args),
+                },
+                "read_return_data" => ReadReturnData {
+                    offset: read_usize!(args),
+                    size: read_usize!(args),
+                    data: read_data!(outs),
+                },
+                "return_data_size" => ReturnDataSize {
+                    size: read_usize!(outs),
+                },
+                "console_log_text" => ConsoleLogText {
+                    text: read_data!(args),
+                },
+                "console_log" => ConsoleLog {
+                    text: read_string!(args),
+                },
+                x => todo!("Missing hostio {x}"),
             };
+
+            assert!(args.is_empty(), "{name}");
+            assert!(outs.is_empty(), "{name}");
 
             frame.steps.push(Hostio {
                 kind,
@@ -213,54 +373,148 @@ impl TraceFrame {
 #[derive(Clone, Debug)]
 pub struct Hostio {
     pub kind: HostioKind,
-    start_ink: u64,
-    end_ink: u64,
+    pub start_ink: u64,
+    pub end_ink: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, SimpleSnakeNames)]
 pub enum HostioKind {
+    UserEntrypoint {
+        args_len: u32,
+    },
+    UserReturned {
+        status: u32,
+    },
     ReadArgs {
         args: Box<[u8]>,
     },
     WriteResult {
         result: Box<[u8]>,
     },
-    MsgValue {
+    StorageLoadBytes32 {
+        key: B256,
         value: B256,
+    },
+    StorageStoreBytes32 {
+        key: B256,
+        value: B256,
+    },
+    AccountBalance {
+        address: Address,
+        balance: U256,
+    },
+    AccountCodehash {
+        address: Address,
+        codehash: B256,
+    },
+    BlockBasefee {
+        basefee: U256,
+    },
+    BlockCoinbase {
+        coinbase: Address,
+    },
+    BlockGasLimit {
+        limit: u64,
+    },
+    BlockNumber {
+        number: u64,
+    },
+    BlockTimestamp {
+        timestamp: u64,
+    },
+    Chainid {
+        chainid: u64,
+    },
+    ContractAddress {
+        address: Address,
+    },
+    EvmGasLeft {
+        gas_left: u64,
+    },
+    EvmInkLeft {
+        ink_left: u64,
     },
     MemoryGrow {
         pages: u16,
     },
-    ContractAddress {
-        address: Address,
+    MsgReentrant {
+        reentrant: bool,
+    },
+    MsgSender {
+        sender: Address,
+    },
+    MsgValue {
+        value: B256,
+    },
+    NativeKeccak256 {
+        preimage: Box<[u8]>,
+        digest: B256,
+    },
+    TxGasPrice {
+        gas_price: U256,
+    },
+    TxInkPrice {
+        ink_price: u32,
+    },
+    TxOrigin {
+        origin: Address,
+    },
+    ConsoleLog {
+        text: String,
+    },
+    ConsoleLogText {
+        text: Box<[u8]>,
     },
     CallContract {
         address: Address,
         data: Box<[u8]>,
         gas: u64,
         value: U256,
-        outs_len: u32,
+        outs_len: usize,
         status: u8,
         frame: TraceFrame,
     },
-    UserEntrypoint,
-    UserReturned,
-}
-
-impl HostioKind {
-    fn name(&self) -> &'static str {
-        use HostioKind as H;
-        match self {
-            H::ReadArgs { .. } => "read_args",
-            H::WriteResult { .. } => "write_result",
-            H::MsgValue { .. } => "msg_value",
-            H::MemoryGrow { .. } => "memory_grow",
-            H::ContractAddress { .. } => "contract_address",
-            H::CallContract { .. } => "call_contract",
-            H::UserEntrypoint => "user_entrypoint",
-            H::UserReturned => "user_returned",
-        }
-    }
+    DelegateCallContract {
+        address: Address,
+        data: Box<[u8]>,
+        gas: u64,
+        outs_len: usize,
+        status: u8,
+        frame: TraceFrame,
+    },
+    StaticCallContract {
+        address: Address,
+        data: Box<[u8]>,
+        gas: u64,
+        outs_len: usize,
+        status: u8,
+        frame: TraceFrame,
+    },
+    Create1 {
+        code: Box<[u8]>,
+        endowment: U256,
+        address: Address,
+        revert_data_len: usize,
+    },
+    Create2 {
+        code: Box<[u8]>,
+        endowment: U256,
+        salt: B256,
+        address: Address,
+        revert_data_len: usize,
+    },
+    EmitLog {
+        data: Box<[u8]>,
+        topics: usize,
+    },
+    ReadReturnData {
+        offset: usize,
+        size: usize,
+        data: Box<[u8]>,
+    },
+    ReturnDataSize {
+        size: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -287,9 +541,18 @@ impl FrameReader {
             if hostio.kind.name() == expected {
                 return hostio;
             }
-            match hostio.kind.name() {
+            let kind = hostio.kind;
+            match kind.name() {
                 "memory_grow" | "user_entrypoint" => continue,
-                _ => panic!("incorrect hostio:\nexpected {expected}\nfound {hostio:?}"),
+                _ => {
+                    for step in &self.frame.steps {
+                        println!("Step: {:#?}", step.kind);
+                    }
+                    panic!(
+                        "incorrect hostio:\n\texpected {expected}\n\tfound    {kind:?} {}\n",
+                        kind.name()
+                    )
+                }
             }
         }
     }

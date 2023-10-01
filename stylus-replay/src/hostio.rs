@@ -7,48 +7,55 @@ use crate::trace::{FrameReader, HostioKind::*};
 use function_name::named;
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
-use std::{mem, ptr::copy_nonoverlapping as memcpy};
+use std::{
+    mem::{self, MaybeUninit},
+    ptr::copy_nonoverlapping as memcpy,
+};
 
 lazy_static! {
     pub static ref FRAME: Mutex<Option<FrameReader>> = Mutex::new(None);
-    pub static ref INK_LEFT: Mutex<u64> = Mutex::new(0);
+    pub static ref START_INK: Mutex<u64> = Mutex::new(0);
+    pub static ref END_INK: Mutex<u64> = Mutex::new(0);
 }
 
 macro_rules! frame {
     ($dec:pat) => {
-        let $dec = FRAME
-            .lock()
-            .as_mut()
-            .unwrap()
-            .next_hostio(function_name!())
-            .kind
-        else {
-            unreachable!()
-        };
+        let hostio = FRAME.lock().as_mut().unwrap().next_hostio(function_name!());
+        *START_INK.lock() = hostio.start_ink;
+        *END_INK.lock() = hostio.end_ink;
+
+        let $dec = hostio.kind else { unreachable!() };
     };
 }
 
-/// Gets the ETH balance in wei of the account at the given address.
-/// The semantics are equivalent to that of the EVM's [`BALANCE`] opcode.
-///
-/// [`BALANCE`]: https://www.evm.codes/#31
-#[named]
-#[no_mangle]
-pub unsafe extern "C" fn account_balance(address: *const u8, dest: *mut u8) {
-    //let hostio = frame!();
-    todo!()
+macro_rules! copy {
+    ($src:expr, $dest:expr) => {
+        memcpy($src.as_ptr(), $dest, mem::size_of_val(&$src))
+    };
+    ($src:expr, $dest:expr, $len:expr) => {
+        memcpy($src.as_ptr(), $dest, $len)
+    };
 }
 
-/// Gets the code hash of the account at the given address. The semantics are equivalent
-/// to that of the EVM's [`EXT_CODEHASH`] opcode. Note that the code hash of an account without
-/// code will be the empty hash
-/// `keccak("") = c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`.
+/// Reads the program calldata. The semantics are equivalent to that of the EVM's
+/// [`CALLDATA_COPY`] opcode when requesting the entirety of the current call's calldata.
 ///
-/// [`EXT_CODEHASH`]: https://www.evm.codes/#3F
+/// [`CALLDATA_COPY`]: https://www.evm.codes/#37
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn account_codehash(address: *const u8, dest: *mut u8) {
-    todo!()
+pub unsafe extern "C" fn read_args(dest: *mut u8) {
+    frame!(ReadArgs { args });
+    copy!(args, dest, args.len());
+}
+
+/// Writes the final return data. If not called before the program exists, the return data will
+/// be 0 bytes long. Note that this hostio does not cause the program to exit, which happens
+/// naturally when `user_entrypoint` returns.
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn write_result(data: *const u8, len: usize) {
+    frame!(WriteResult { result });
+    assert_eq!(read_bytes(data, len), &*result);
 }
 
 /// Reads a 32-byte value from permanent storage. Stylus's storage format is identical to
@@ -59,8 +66,10 @@ pub unsafe extern "C" fn account_codehash(address: *const u8, dest: *mut u8) {
 /// [`SLOAD`]: https://www.evm.codes/#54
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn storage_load_bytes32(key: *const u8, dest: *mut u8) {
-    todo!()
+pub unsafe extern "C" fn storage_load_bytes32(key_ptr: *const u8, dest: *mut u8) {
+    frame!(StorageLoadBytes32 { key, value });
+    assert_eq!(read_fixed(key_ptr), key);
+    copy!(value, dest);
 }
 
 /// Stores a 32-byte value to permanent storage. Stylus's storage format is identical to that
@@ -71,8 +80,36 @@ pub unsafe extern "C" fn storage_load_bytes32(key: *const u8, dest: *mut u8) {
 /// [`SSTORE`]: https://www.evm.codes/#55
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn storage_store_bytes32(key: *const u8, value: *const u8) {
-    todo!()
+pub unsafe extern "C" fn storage_store_bytes32(key_ptr: *const u8, value_ptr: *const u8) {
+    frame!(StorageStoreBytes32 { key, value });
+    assert_eq!(read_fixed(key_ptr), key);
+    assert_eq!(read_fixed(value_ptr), value);
+}
+
+/// Gets the ETH balance in wei of the account at the given address.
+/// The semantics are equivalent to that of the EVM's [`BALANCE`] opcode.
+///
+/// [`BALANCE`]: https://www.evm.codes/#31
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn account_balance(address_ptr: *const u8, dest: *mut u8) {
+    frame!(AccountBalance { address, balance });
+    assert_eq!(read_fixed(address_ptr), address);
+    copy!(balance.to_be_bytes::<32>(), dest);
+}
+
+/// Gets the code hash of the account at the given address. The semantics are equivalent
+/// to that of the EVM's [`EXT_CODEHASH`] opcode. Note that the code hash of an account without
+/// code will be the empty hash
+/// `keccak("") = c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`.
+///
+/// [`EXT_CODEHASH`]: https://www.evm.codes/#3F
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn account_codehash(address_ptr: *const u8, dest: *mut u8) {
+    frame!(AccountCodehash { address, codehash });
+    assert_eq!(read_fixed(address_ptr), address);
+    copy!(codehash, dest);
 }
 
 /// Gets the basefee of the current block. The semantics are equivalent to that of the EVM's
@@ -81,8 +118,9 @@ pub unsafe extern "C" fn storage_store_bytes32(key: *const u8, value: *const u8)
 /// [`BASEFEE`]: https://www.evm.codes/#48
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn block_basefee(basefee: *mut u8) {
-    todo!()
+pub unsafe extern "C" fn block_basefee(dest: *mut u8) {
+    frame!(BlockBasefee { basefee });
+    copy!(basefee.to_be_bytes::<32>(), dest);
 }
 
 /// Gets the coinbase of the current block, which on Arbitrum chains is the L1 batch poster's
@@ -90,8 +128,9 @@ pub unsafe extern "C" fn block_basefee(basefee: *mut u8) {
 /// determines the coinbase.
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn block_coinbase(coinbase: *mut u8) {
-    todo!()
+pub unsafe extern "C" fn block_coinbase(dest: *mut u8) {
+    frame!(BlockCoinbase { coinbase });
+    copy!(coinbase, dest);
 }
 
 /// Gets the gas limit of the current block. The semantics are equivalent to that of the EVM's
@@ -104,7 +143,8 @@ pub unsafe extern "C" fn block_coinbase(coinbase: *mut u8) {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn block_gas_limit() -> u64 {
-    todo!()
+    frame!(BlockGasLimit { limit });
+    limit
 }
 
 /// Gets a bounded estimate of the L1 block number at which the Sequencer sequenced the
@@ -115,7 +155,8 @@ pub unsafe extern "C" fn block_gas_limit() -> u64 {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn block_number() -> u64 {
-    todo!()
+    frame!(BlockNumber { number });
+    number
 }
 
 /// Gets a bounded estimate of the Unix timestamp at which the Sequencer sequenced the
@@ -126,7 +167,8 @@ pub unsafe extern "C" fn block_number() -> u64 {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn block_timestamp() -> u64 {
-    todo!()
+    frame!(BlockTimestamp { timestamp });
+    timestamp
 }
 
 /// Gets the unique chain identifier of the Arbitrum chain. The semantics are equivalent to
@@ -136,7 +178,8 @@ pub unsafe extern "C" fn block_timestamp() -> u64 {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn chainid() -> u64 {
-    23011913
+    frame!(Chainid { chainid });
+    chainid
 }
 
 /// Calls the contract at the given address with options for passing value and to limit the
@@ -156,11 +199,11 @@ pub unsafe extern "C" fn chainid() -> u64 {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn call_contract(
-    contract: *const u8,
+    address_ptr: *const u8,
     calldata: *const u8,
     calldata_len: usize,
-    value: *const u8,
-    gas: u64,
+    value_ptr: *const u8,
+    gas_supplied: u64,
     return_data_len: *mut usize,
 ) -> u8 {
     frame!(CallContract {
@@ -172,7 +215,87 @@ pub unsafe extern "C" fn call_contract(
         status,
         frame,
     });
-    //memcpy(address.as_ptr(), dest, mem::size_of_val(address))
+    assert_eq!(read_fixed(address_ptr), address);
+    assert_eq!(read_bytes(calldata, calldata_len), &*data);
+    assert_eq!(read_fixed(value_ptr), value.to_be_bytes::<32>());
+    assert_eq!(gas_supplied, gas);
+    *return_data_len = outs_len;
+    status
+}
+
+/// Delegate calls the contract at the given address, with the option to limit the amount of
+/// gas supplied. The return status indicates whether the call succeeded, and is nonzero on
+/// failure.
+///
+/// In both cases `return_data_len` will store the length of the result, the bytes of which
+/// can be read via the `read_return_data` hostio. The bytes are not returned directly so that
+/// the programmer can potentially save gas by choosing which subset of the return result
+/// they'd like to copy.
+///
+/// The semantics are equivalent to that of the EVM's [`DELEGATE_CALL`] opcode, including the
+/// 63/64 gas rule. This means that supplying `u64::MAX` gas can be used to send as much as
+/// possible.
+///
+/// [`DELEGATE_CALL`]: https://www.evm.codes/#F4
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn delegate_call_contract(
+    address_ptr: *const u8,
+    calldata: *const u8,
+    calldata_len: usize,
+    gas_supplied: u64,
+    return_data_len: *mut usize,
+) -> u8 {
+    frame!(DelegateCallContract {
+        address,
+        data,
+        gas,
+        outs_len,
+        status,
+        frame,
+    });
+    assert_eq!(read_fixed(address_ptr), address);
+    assert_eq!(read_bytes(calldata, calldata_len), &*data);
+    assert_eq!(gas_supplied, gas);
+    *return_data_len = outs_len;
+    status
+}
+
+/// Static calls the contract at the given address, with the option to limit the amount of gas
+/// supplied. The return status indicates whether the call succeeded, and is nonzero on
+/// failure.
+///
+/// In both cases `return_data_len` will store the length of the result, the bytes of which can
+/// be read via the `read_return_data` hostio. The bytes are not returned directly so that the
+/// programmer can potentially save gas by choosing which subset of the return result they'd
+/// like to copy.
+///
+/// The semantics are equivalent to that of the EVM's [`STATIC_CALL`] opcode, including the
+/// 63/64 gas rule. This means that supplying `u64::MAX` gas can be used to send as much as
+/// possible.
+///
+/// [`STATIC_CALL`]: https://www.evm.codes/#FA
+#[named]
+#[no_mangle]
+pub unsafe extern "C" fn static_call_contract(
+    address_ptr: *const u8,
+    calldata: *const u8,
+    calldata_len: usize,
+    gas_supplied: u64,
+    return_data_len: *mut usize,
+) -> u8 {
+    frame!(StaticCallContract {
+        address,
+        data,
+        gas,
+        outs_len,
+        status,
+        frame,
+    });
+    assert_eq!(read_fixed(address_ptr), address);
+    assert_eq!(read_bytes(calldata, calldata_len), &*data);
+    assert_eq!(gas_supplied, gas);
+    *return_data_len = outs_len;
     status
 }
 
@@ -184,7 +307,7 @@ pub unsafe extern "C" fn call_contract(
 #[no_mangle]
 pub unsafe extern "C" fn contract_address(dest: *mut u8) {
     frame!(ContractAddress { address });
-    memcpy(address.as_ptr(), dest, mem::size_of_val(&address))
+    copy!(address, dest);
 }
 
 /// Deploys a new contract using the init code provided, which the EVM executes to construct
@@ -205,13 +328,22 @@ pub unsafe extern "C" fn contract_address(dest: *mut u8) {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn create1(
-    code: *const u8,
+    code_ptr: *const u8,
     code_len: usize,
-    endowment: *const u8,
+    value: *const u8,
     contract: *mut u8,
-    revert_data_len: *mut usize,
+    revert_data_len_ptr: *mut usize,
 ) {
-    todo!()
+    frame!(Create1 {
+        code,
+        endowment,
+        address,
+        revert_data_len
+    });
+    assert_eq!(read_bytes(code_ptr, code_len), &*code);
+    assert_eq!(read_fixed(value), endowment.to_be_bytes::<32>());
+    copy!(address, contract);
+    *revert_data_len_ptr = revert_data_len;
 }
 
 /// Deploys a new contract using the init code provided, which the EVM executes to construct
@@ -232,40 +364,25 @@ pub unsafe extern "C" fn create1(
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn create2(
-    code: *const u8,
+    code_ptr: *const u8,
     code_len: usize,
-    endowment: *const u8,
-    salt: *const u8,
+    value_ptr: *const u8,
+    salt_ptr: *const u8,
     contract: *mut u8,
-    revert_data_len: *mut usize,
+    revert_data_len_ptr: *mut usize,
 ) {
-    todo!()
-}
-
-/// Delegate calls the contract at the given address, with the option to limit the amount of
-/// gas supplied. The return status indicates whether the call succeeded, and is nonzero on
-/// failure.
-///
-/// In both cases `return_data_len` will store the length of the result, the bytes of which
-/// can be read via the `read_return_data` hostio. The bytes are not returned directly so that
-/// the programmer can potentially save gas by choosing which subset of the return result
-/// they'd like to copy.
-///
-/// The semantics are equivalent to that of the EVM's [`DELEGATE_CALL`] opcode, including the
-/// 63/64 gas rule. This means that supplying `u64::MAX` gas can be used to send as much as
-/// possible.
-///
-/// [`DELEGATE_CALL`]: https://www.evm.codes/#F4
-#[named]
-#[no_mangle]
-pub unsafe extern "C" fn delegate_call_contract(
-    contract: *const u8,
-    calldata: *const u8,
-    calldata_len: usize,
-    gas: u64,
-    return_data_len: *mut usize,
-) -> u8 {
-    todo!()
+    frame!(Create2 {
+        code,
+        endowment,
+        salt,
+        address,
+        revert_data_len
+    });
+    assert_eq!(read_bytes(code_ptr, code_len), &*code);
+    assert_eq!(read_fixed(value_ptr), endowment.to_be_bytes::<32>());
+    assert_eq!(read_fixed(salt_ptr), salt);
+    copy!(address, contract);
+    *revert_data_len_ptr = revert_data_len;
 }
 
 /// Emits an EVM log with the given number of topics and data, the first bytes of which should
@@ -280,8 +397,10 @@ pub unsafe extern "C" fn delegate_call_contract(
 /// [`LOG4`]: https://www.evm.codes/#a4
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn emit_log(data: *const u8, len: usize, topics: usize) {
-    todo!()
+pub unsafe extern "C" fn emit_log(data_ptr: *const u8, len: usize, topic_count: usize) {
+    frame!(EmitLog { data, topics });
+    assert_eq!(read_bytes(data_ptr, len), &*data);
+    assert_eq!(topics, topic_count);
 }
 
 /// Gets the amount of gas left after paying for the cost of this hostio. The semantics are
@@ -291,7 +410,8 @@ pub unsafe extern "C" fn emit_log(data: *const u8, len: usize, topics: usize) {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn evm_gas_left() -> u64 {
-    todo!()
+    frame!(EvmGasLeft { gas_left });
+    gas_left
 }
 
 /// Gets the amount of ink remaining after paying for the cost of this hostio. The semantics
@@ -303,7 +423,8 @@ pub unsafe extern "C" fn evm_gas_left() -> u64 {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn evm_ink_left() -> u64 {
-    todo!()
+    frame!(EvmInkLeft { ink_left });
+    ink_left
 }
 
 /// The `entrypoint!` macro handles importing this hostio, which is required if the
@@ -312,16 +433,17 @@ pub unsafe extern "C" fn evm_ink_left() -> u64 {
 /// Calls made voluntarily will unproductively consume gas.
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn memory_grow(pages: u16) {
-    //let hostio = frame!();
-    todo!()
+pub unsafe extern "C" fn memory_grow(new_pages: u16) {
+    frame!(MemoryGrow { pages });
+    assert_eq!(new_pages, pages);
 }
 
 /// Whether the current call is reentrant.
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn msg_reentrant() -> bool {
-    todo!()
+    frame!(MsgReentrant { reentrant });
+    reentrant
 }
 
 /// Gets the address of the account that called the program. For normal L2-to-L2 transactions
@@ -336,8 +458,9 @@ pub unsafe extern "C" fn msg_reentrant() -> bool {
 /// [`Retryable Ticket Address Aliasing`]: https://developer.arbitrum.io/arbos/l1-to-l2-messaging#address-aliasing
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn msg_sender(sender: *mut u8) {
-    todo!()
+pub unsafe extern "C" fn msg_sender(dest: *mut u8) {
+    frame!(MsgSender { sender });
+    copy!(sender, dest);
 }
 
 /// Get the ETH value in wei sent to the program. The semantics are equivalent to that of the
@@ -348,7 +471,7 @@ pub unsafe extern "C" fn msg_sender(sender: *mut u8) {
 #[no_mangle]
 pub unsafe extern "C" fn msg_value(dest: *mut u8) {
     frame!(MsgValue { value });
-    memcpy(value.as_ptr(), dest, mem::size_of_val(&value))
+    copy!(value, dest);
 }
 
 /// Efficiently computes the [`keccak256`] hash of the given preimage.
@@ -359,18 +482,9 @@ pub unsafe extern "C" fn msg_value(dest: *mut u8) {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn native_keccak256(bytes: *const u8, len: usize, output: *mut u8) {
-    todo!()
-}
-
-/// Reads the program calldata. The semantics are equivalent to that of the EVM's
-/// [`CALLDATA_COPY`] opcode when requesting the entirety of the current call's calldata.
-///
-/// [`CALLDATA_COPY`]: https://www.evm.codes/#37
-#[named]
-#[no_mangle]
-pub unsafe extern "C" fn read_args(dest: *mut u8) {
-    frame!(ReadArgs { args });
-    memcpy(args.as_ptr(), dest, args.len());
+    frame!(NativeKeccak256 { preimage, digest });
+    assert_eq!(read_bytes(bytes, len), &*preimage);
+    copy!(digest, output);
 }
 
 /// Copies the bytes of the last EVM call or deployment return result. Does not revert if out of
@@ -380,17 +494,16 @@ pub unsafe extern "C" fn read_args(dest: *mut u8) {
 /// [`RETURN_DATA_COPY`]: https://www.evm.codes/#3e
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn read_return_data(dest: *mut u8, offset: usize, size: usize) -> usize {
-    todo!()
-}
-
-/// Writes the final return data. If not called before the program exists, the return data will
-/// be 0 bytes long. Note that this hostio does not cause the program to exit, which happens
-/// naturally when `user_entrypoint` returns.
-#[named]
-#[no_mangle]
-pub unsafe extern "C" fn write_result(data: *const u8, len: usize) {
-    frame!(WriteResult { result });
+pub unsafe extern "C" fn read_return_data(
+    dest: *mut u8,
+    offset_value: usize,
+    size_value: usize,
+) -> usize {
+    frame!(ReadReturnData { offset, size, data });
+    assert_eq!(offset_value, offset);
+    assert_eq!(size_value, size);
+    copy!(data, dest, data.len());
+    data.len()
 }
 
 /// Returns the length of the last EVM call or deployment return result, or `0` if neither have
@@ -401,33 +514,8 @@ pub unsafe extern "C" fn write_result(data: *const u8, len: usize) {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn return_data_size() -> usize {
-    todo!()
-}
-
-/// Static calls the contract at the given address, with the option to limit the amount of gas
-/// supplied. The return status indicates whether the call succeeded, and is nonzero on
-/// failure.
-///
-/// In both cases `return_data_len` will store the length of the result, the bytes of which can
-/// be read via the `read_return_data` hostio. The bytes are not returned directly so that the
-/// programmer can potentially save gas by choosing which subset of the return result they'd
-/// like to copy.
-///
-/// The semantics are equivalent to that of the EVM's [`STATIC_CALL`] opcode, including the
-/// 63/64 gas rule. This means that supplying `u64::MAX` gas can be used to send as much as
-/// possible.
-///
-/// [`STATIC_CALL`]: https://www.evm.codes/#FA
-#[named]
-#[no_mangle]
-pub unsafe extern "C" fn static_call_contract(
-    contract: *const u8,
-    calldata: *const u8,
-    calldata_len: usize,
-    gas: u64,
-    return_data_len: *mut usize,
-) -> u8 {
-    todo!()
+    frame!(ReturnDataSize { size });
+    size
 }
 
 /// Gets the gas price in wei per gas, which on Arbitrum chains equals the basefee. The
@@ -436,8 +524,9 @@ pub unsafe extern "C" fn static_call_contract(
 /// [`GAS_PRICE`]: https://www.evm.codes/#3A
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn tx_gas_price(gas_price: *mut u8) {
-    todo!()
+pub unsafe extern "C" fn tx_gas_price(dest: *mut u8) {
+    frame!(TxGasPrice { gas_price });
+    copy!(gas_price.to_be_bytes::<32>(), dest);
 }
 
 /// Gets the price of ink in evm gas basis points. See [`Ink and Gas`] for more information on
@@ -447,7 +536,8 @@ pub unsafe extern "C" fn tx_gas_price(gas_price: *mut u8) {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn tx_ink_price() -> u32 {
-    todo!()
+    frame!(TxInkPrice { ink_price });
+    ink_price
 }
 
 /// Gets the top-level sender of the transaction. The semantics are equivalent to that of the
@@ -456,8 +546,9 @@ pub unsafe extern "C" fn tx_ink_price() -> u32 {
 /// [`ORIGIN`]: https://www.evm.codes/#32
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn tx_origin(origin: *mut u8) {
-    todo!()
+pub unsafe extern "C" fn tx_origin(dest: *mut u8) {
+    frame!(TxOrigin { origin });
+    copy!(origin, dest);
 }
 
 /// Prints a 32-bit floating point number to the console. Only available in debug mode with
@@ -465,7 +556,8 @@ pub unsafe extern "C" fn tx_origin(origin: *mut u8) {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn log_f32(value: f32) {
-    todo!()
+    frame!(ConsoleLog { text });
+    println!("{text}");
 }
 
 /// Prints a 64-bit floating point number to the console. Only available in debug mode with
@@ -473,7 +565,8 @@ pub unsafe extern "C" fn log_f32(value: f32) {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn log_f64(value: f64) {
-    todo!()
+    frame!(ConsoleLog { text });
+    println!("{text}");
 }
 
 /// Prints a 32-bit integer to the console, which can be either signed or unsigned.
@@ -481,7 +574,8 @@ pub unsafe extern "C" fn log_f64(value: f64) {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn log_i32(value: i32) {
-    todo!()
+    frame!(ConsoleLog { text });
+    println!("{text}");
 }
 
 /// Prints a 64-bit integer to the console, which can be either signed or unsigned.
@@ -489,12 +583,27 @@ pub unsafe extern "C" fn log_i32(value: i32) {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn log_i64(value: i64) {
-    todo!()
+    frame!(ConsoleLog { text });
+    println!("{text}");
 }
 
 /// Prints a UTF-8 encoded string to the console. Only available in debug mode.
 #[named]
 #[no_mangle]
-pub unsafe extern "C" fn log_txt(text: *const u8, len: usize) {
-    todo!()
+pub unsafe extern "C" fn log_txt(text_ptr: *const u8, len: usize) {
+    frame!(ConsoleLogText { text });
+    assert_eq!(read_bytes(text_ptr, len), &*text);
+}
+
+unsafe fn read_fixed<const N: usize>(ptr: *const u8) -> [u8; N] {
+    let mut value = MaybeUninit::<[u8; N]>::uninit();
+    memcpy(ptr, value.as_mut_ptr() as *mut _, N);
+    value.assume_init()
+}
+
+unsafe fn read_bytes(ptr: *const u8, len: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(len);
+    memcpy(ptr, data.as_mut_ptr(), len);
+    data.set_len(len);
+    data
 }

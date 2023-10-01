@@ -41,6 +41,8 @@ async fn main() -> Result<()> {
     };
 
     let trace = Trace::new(provider, opts.tx).await?;
+
+    util::build_so(&opts.project)?;
     let so = util::find_so(&opts.project)?;
 
     // TODO: don't assume the contract is top-level
@@ -51,10 +53,9 @@ async fn main() -> Result<()> {
 
         type Entrypoint = unsafe extern "C" fn(usize) -> usize;
         let lib = libloading::Library::new(so)?;
-        let func: libloading::Symbol<Entrypoint> = lib.get(b"user_entrypoint")?;
-        let status = func(args_len);
+        let main: libloading::Symbol<Entrypoint> = lib.get(b"user_entrypoint")?;
+        let status = main(args_len);
         println!("contract exited with status: {status}");
     }
-
     Ok(())
 }
