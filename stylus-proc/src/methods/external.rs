@@ -13,7 +13,8 @@ use syn::{
     parse_macro_input,
     punctuated::Punctuated,
     spanned::Spanned,
-    FnArg, ImplItem, Index, ItemImpl, Lit, LitStr, Pat, PatType, Result, ReturnType, Token, Type,
+    Attribute, FnArg, ImplItem, Index, ItemImpl, Lit, LitStr, Pat, PatType, Path, Result,
+    ReturnType, Token, Type,
 };
 
 pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
@@ -28,37 +29,15 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
             continue;
         };
 
-        // see if user chose a purity or selector (TODO: use drain_filter when stable)
-        let mut purity = None;
-        let mut override_id = None;
-        let mut override_name = None;
+        // see if user chose a purity or selector, including fallback or receive
+        let mut attrs = FunctionAttrs::new();
         for attr in mem::take(&mut method.attrs) {
-            let Some(ident) = attr.path.get_ident() else {
-                continue;
-            };
-            if let Ok(elem) = Purity::from_str(&ident.to_string()) {
-                if !attr.tokens.is_empty() {
-                    error!(attr.tokens, "attribute does not take parameters");
-                }
-                if purity.is_some() {
-                    error!(attr.path, "more than one purity attribute");
-                }
-                purity = Some(elem);
-                continue;
+            // parse out our attributes, and put the rest back into method.attrs
+            match attrs.parse(attr) {
+                Ok(Some(attr)) => method.attrs.push(attr),
+                Err(err) => return err.to_compile_error().into(),
+                _ => continue,
             }
-            if *ident == "selector" {
-                if override_id.is_some() || override_name.is_some() {
-                    error!(attr.path, "more than one selector attribute");
-                }
-                let args = match syn::parse2::<SelectorArgs>(attr.tokens.clone()) {
-                    Ok(args) => args,
-                    Err(error) => error!(ident, "{}", error),
-                };
-                override_id = args.id;
-                override_name = args.name;
-                continue;
-            }
-            method.attrs.push(attr);
         }
 
         use Purity::*;
@@ -66,20 +45,30 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
         // determine purity if not
         let mut args = method.sig.inputs.iter().peekable();
         let mut has_self = false;
-        let needed_purity = match args.peek() {
-            Some(FnArg::Receiver(recv)) => {
-                has_self = true;
-                recv.mutability.into()
-            }
-            Some(FnArg::Typed(PatType { ty, .. })) => match &**ty {
-                Type::Reference(ty) => ty.mutability.into(),
+        let needed_purity = if matches!(attrs.selector, Some(SelectorType::Receive(_))) {
+            // receive function must be payable
+            Payable
+        } else {
+            match args.peek() {
+                Some(FnArg::Receiver(recv)) => {
+                    has_self = true;
+                    recv.mutability.into()
+                }
+                Some(FnArg::Typed(PatType { ty, .. })) => match &**ty {
+                    Type::Reference(ty) => ty.mutability.into(),
+                    _ => Pure,
+                },
                 _ => Pure,
-            },
-            _ => Pure,
+            }
         };
 
         // enforce purity
-        let purity = purity.unwrap_or(needed_purity);
+        let purity = attrs.purity.unwrap_or(needed_purity);
+        if let Some(SelectorType::Receive(attr_path)) = &attrs.selector {
+            if purity < Payable {
+                error!(attr_path, "receive method must be payable");
+            }
+        }
         if purity == Pure && purity < needed_purity {
             error!(args.next(), "pure method must not access storage");
         }
@@ -106,7 +95,14 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
             .collect();
 
         let name = &method.sig.ident;
-        let sol_name = override_name.unwrap_or(name.to_string().to_case(Case::Camel));
+        // name for selector and abi-export (None for fallback and receive)
+        let sol_name = match &attrs.selector {
+            Some(SelectorType::Selector(SelectorArg::Name(override_name))) => {
+                Some(override_name.clone())
+            }
+            Some(SelectorType::Fallback | SelectorType::Receive(_)) => None,
+            _ => Some(name.to_string().to_case(Case::Camel)),
+        };
 
         // deny value when method isn't payable
         let mut deny_value = quote!();
@@ -142,43 +138,54 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
         let constant = Ident::new(&format!("SELECTOR_{name}"), name.span());
         let arg_types: &Vec<_> = &args.iter().map(|a| &a.1).collect();
 
-        let selector = match override_id {
-            Some(id) => quote! { #id },
-            None => quote! { u32::from_be_bytes(function_selector!(#sol_name #(, #arg_types )*)) },
-        };
-        selectors.extend(quote! {
-            #[allow(non_upper_case_globals)]
-            const #constant: u32 = #selector;
-        });
-
-        let in_span = method.sig.inputs.span();
-        let decode_inputs = quote_spanned! { in_span => <(#( #arg_types, )*) as AbiType>::SolType };
-
-        let ret_span = match &method.sig.output {
-            x @ ReturnType::Default => x.span(),
-            ReturnType::Type(_, ty) => ty.span(), // right of arrow
-        };
-        let encode_result = quote_spanned! { ret_span => EncodableReturnType::encode(result) };
-
-        // match against the selector
-        match_selectors.extend(quote! {
-            #[allow(non_upper_case_globals)]
-            #constant => {
-                #deny_value
-                let args = match <#decode_inputs as SolType>::abi_decode_params(input, true) {
-                    Ok(args) => args,
-                    Err(err) => {
-                        internal::failed_to_decode_arguments(err);
-                        return Some(Err(vec![]));
-                    }
-                };
-                let result = Self::#name(#storage #(#expand_args, )* );
-                Some(#encode_result)
+        let selector = match (&attrs.selector, &sol_name) {
+            (Some(SelectorType::Selector(SelectorArg::Id(id))), _) => Some(quote! { #id }),
+            (_, Some(sol_name)) => {
+                Some(quote! { u32::from_be_bytes(function_selector!(#sol_name #(, #arg_types )*)) })
             }
-        });
+            _ => None,
+        };
+        if let Some(selector) = selector {
+            selectors.extend(quote! {
+                #[allow(non_upper_case_globals)]
+                const #constant: u32 = #selector;
+            });
 
-        // only collect abi info if enabled
-        if cfg!(not(feature = "export-abi")) {
+            let in_span = method.sig.inputs.span();
+            let decode_inputs =
+                quote_spanned! { in_span => <(#( #arg_types, )*) as AbiType>::SolType };
+
+            let ret_span = match &method.sig.output {
+                x @ ReturnType::Default => x.span(),
+                ReturnType::Type(_, ty) => ty.span(), // right of arrow
+            };
+            let encode_result = quote_spanned! { ret_span => EncodableReturnType::encode(result) };
+
+            // match against the selector
+            match_selectors.extend(quote! {
+                #[allow(non_upper_case_globals)]
+                #constant => {
+                    #deny_value
+                    let args = match <#decode_inputs as SolType>::abi_decode_params(input, true) {
+                        Ok(args) => args,
+                        Err(err) => {
+                            internal::failed_to_decode_arguments(err);
+                            return Some(Err(vec![]));
+                        }
+                    };
+                    let result = Self::#name(#storage #(#expand_args, )* );
+                    Some(#encode_result)
+                }
+            });
+        }
+
+        // only collect abi info if enabled, and skip fallback/receive
+        if cfg!(not(feature = "export-abi"))
+            || matches!(
+                attrs.selector,
+                Some(SelectorType::Fallback) | Some(SelectorType::Receive(_))
+            )
+        {
             continue;
         }
 
@@ -199,7 +206,7 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
         };
 
         let mut comment = quote!();
-        if let Some(id) = override_id {
+        if let Some(SelectorType::Selector(SelectorArg::Id(id))) = &attrs.selector {
             comment.extend(quote! {
                 write!(f, "\n    // note: selector was overridden to be 0x{:x}.", #id)?;
             });
@@ -374,12 +381,82 @@ impl Parse for InheritsAttr {
     }
 }
 
-struct SelectorArgs {
-    id: Option<u32>,
-    name: Option<String>,
+struct FunctionAttrs {
+    purity: Option<Purity>,
+    selector: Option<SelectorType>,
 }
 
-impl Parse for SelectorArgs {
+impl FunctionAttrs {
+    fn new() -> Self {
+        Self {
+            purity: None,
+            selector: None,
+        }
+    }
+
+    /// Parse an attribute from a function.
+    ///
+    /// Returns the attribute if it was not used.
+    fn parse(&mut self, attr: Attribute) -> Result<Option<Attribute>> {
+        let Some(ident) = attr.path.get_ident() else {
+            return Ok(Some(attr));
+        };
+        if let Ok(elem) = Purity::from_str(&ident.to_string()) {
+            Self::check_empty(&attr)?;
+            if self.purity.is_some() {
+                error!(@attr.path, "more than one purity attribute");
+            }
+            self.purity = Some(elem);
+            return Ok(None);
+        }
+        if *ident == "selector" {
+            self.check_no_selector(&attr)?;
+            let arg = syn::parse2(attr.tokens.clone())?;
+            self.selector = Some(SelectorType::Selector(arg));
+            return Ok(None);
+        }
+        if *ident == "fallback" {
+            Self::check_empty(&attr)?;
+            self.check_no_selector(&attr)?;
+            self.selector = Some(SelectorType::Fallback);
+            return Ok(None);
+        }
+        if *ident == "receive" {
+            Self::check_empty(&attr)?;
+            self.check_no_selector(&attr)?;
+            self.selector = Some(SelectorType::Receive(attr.path));
+            return Ok(None);
+        }
+        Ok(Some(attr))
+    }
+
+    fn check_empty(attr: &Attribute) -> Result<()> {
+        if !attr.tokens.is_empty() {
+            error!(@attr.tokens, "attribute does not take parameters");
+        }
+        Ok(())
+    }
+
+    fn check_no_selector(&self, attr: &Attribute) -> Result<()> {
+        if self.selector.is_some() {
+            error!(@attr.path, "more than one selector attribute");
+        }
+        Ok(())
+    }
+}
+
+enum SelectorType {
+    Fallback,
+    Receive(Path),
+    Selector(SelectorArg),
+}
+
+enum SelectorArg {
+    Id(u32),
+    Name(String),
+}
+
+impl Parse for SelectorArg {
     fn parse(input: ParseStream) -> Result<Self> {
         let mut id = None;
         let mut name = None;
@@ -429,9 +506,10 @@ impl Parse for SelectorArgs {
             let _: Result<Token![,]> = input.parse();
         }
 
-        if id.is_some() == name.is_some() {
-            error!(@input.span(), r#"only one of "id" or "name" expected"#);
+        match (id, name) {
+            (Some(id), None) => Ok(SelectorArg::Id(id)),
+            (None, Some(name)) => Ok(SelectorArg::Name(name)),
+            _ => error!(@input.span(), r#"only one of "id" or "name" expected"#),
         }
-        Ok(Self { id, name })
     }
 }
