@@ -23,6 +23,8 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut match_selectors = quote!();
     let mut abi = quote!();
     let mut types = vec![];
+    let mut fallback = quote!();
+    let mut receive = quote!();
 
     for item in input.items.iter_mut() {
         let ImplItem::Method(method) = item else {
@@ -45,21 +47,20 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
         // determine purity if not
         let mut args = method.sig.inputs.iter().peekable();
         let mut has_self = false;
-        let needed_purity = if matches!(attrs.selector, Some(SelectorType::Receive(_))) {
-            // receive function must be payable
-            Payable
-        } else {
-            match args.peek() {
-                Some(FnArg::Receiver(recv)) => {
-                    has_self = true;
-                    recv.mutability.into()
-                }
-                Some(FnArg::Typed(PatType { ty, .. })) => match &**ty {
-                    Type::Reference(ty) => ty.mutability.into(),
-                    _ => Pure,
-                },
-                _ => Pure,
+        let mut needed_purity = match args.peek() {
+            Some(FnArg::Receiver(recv)) => {
+                has_self = true;
+                recv.mutability.into()
             }
+            Some(FnArg::Typed(PatType { ty, .. })) => match &**ty {
+                Type::Reference(ty) => ty.mutability.into(),
+                _ => Pure,
+            },
+            _ => Pure,
+        };
+        // receive function must be payable
+        if matches!(attrs.selector, Some(SelectorType::Receive(_))) {
+            needed_purity = Payable;
         };
 
         // enforce purity
@@ -95,7 +96,7 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
             .collect();
 
         let name = &method.sig.ident;
-        // name for selector and abi-export (None for fallback and receive)
+        // name for selector and export-abi (None for fallback and receive)
         let sol_name = match &attrs.selector {
             Some(SelectorType::Selector(SelectorArg::Name(override_name))) => {
                 Some(override_name.clone())
@@ -145,6 +146,13 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
             }
             _ => None,
         };
+
+        let ret_span = match &method.sig.output {
+            x @ ReturnType::Default => x.span(),
+            ReturnType::Type(_, ty) => ty.span(), // right of arrow
+        };
+        let encode_result = quote_spanned! { ret_span => EncodableReturnType::encode(result) };
+
         if let Some(selector) = selector {
             selectors.extend(quote! {
                 #[allow(non_upper_case_globals)]
@@ -154,12 +162,6 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
             let in_span = method.sig.inputs.span();
             let decode_inputs =
                 quote_spanned! { in_span => <(#( #arg_types, )*) as AbiType>::SolType };
-
-            let ret_span = match &method.sig.output {
-                x @ ReturnType::Default => x.span(),
-                ReturnType::Type(_, ty) => ty.span(), // right of arrow
-            };
-            let encode_result = quote_spanned! { ret_span => EncodableReturnType::encode(result) };
 
             // match against the selector
             match_selectors.extend(quote! {
@@ -177,6 +179,30 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
                     Some(#encode_result)
                 }
             });
+        }
+
+        // fallback function
+        if matches!(&attrs.selector, Some(SelectorType::Receive(_))) {
+            // TODO: fallback args & return
+            fallback = quote! {
+                #[inline]
+                fn fallback(storage: &mut S, input: &[u8]) -> Option<stylus_sdk::ArbResult> {
+                    use stylus_sdk::abi::internal::EncodableReturnType;
+                    let result = Self::#name(#storage);
+                    Some(#encode_result)
+                }
+            };
+        }
+
+        // receive function
+        if matches!(&attrs.selector, Some(SelectorType::Receive(_))) {
+            receive = quote! {
+                #[inline]
+                fn receive(storage: &mut S) -> Option<stylus_sdk::ArbResult> {
+                    let _: () = Self::#name(#storage);
+                    Some(Ok(vec![]))
+                }
+            };
         }
 
         // only collect abi info if enabled, and skip fallback/receive
@@ -296,6 +322,10 @@ pub fn external(_attr: TokenStream, input: TokenStream) -> TokenStream {
                     }
                 }
             }
+
+            #fallback
+
+            #receive
         }
     };
 

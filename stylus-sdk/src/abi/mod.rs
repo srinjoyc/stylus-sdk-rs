@@ -46,9 +46,30 @@ where
     type Storage;
 
     /// Tries to find and execute a method for the given selector, returning `None` if none is found.
-    /// Routes add via `#[inherit]` will only execute if no match is found among `Self`.
+    /// Routes added via `#[inherit]` will only execute if no match is found among `Self`.
     /// This means that it is possible to override a method by redefining it in `Self`.
     fn route(storage: &mut S, selector: u32, input: &[u8]) -> Option<ArbResult>;
+
+    /// Executes a receive Ether function if one has been defined, returning `None` if one has
+    /// not. The receive Ether function follows the same inheritance rules as the [Router::route]
+    /// method.
+    ///
+    /// This receive Ether function is executed when the contract is called with empty
+    /// calldata. It is executed when `send` or `transfer` is used on this contract.
+    ///
+    /// This function cannot return anything.
+    fn receive(_storage: &mut S) -> Option<ArbResult> {
+        None
+    }
+
+    /// Executes a fallback function if one has been defined, returning `None` if one has not. The
+    /// fallback function follows the same inheritance rules as the [Router::route] method.
+    ///
+    /// This fallback function is called either when there is no selector match, or in place of the
+    /// receive function when it is marked `payable`.
+    fn fallback(_storage: &mut S, _input: &[u8]) -> Option<ArbResult> {
+        None
+    }
 }
 
 /// Provides a mapping of Rust to Solidity types.

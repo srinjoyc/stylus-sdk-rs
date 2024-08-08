@@ -29,17 +29,39 @@ pub fn entrypoint(attr: TokenStream, input: TokenStream) -> TokenStream {
                     use core::convert::TryInto;
                     use alloc::vec;
 
+                    let mut storage = unsafe { <#name as StorageType>::new(U256::ZERO, 0) };
+
+                    // no calldata, try receive and fallback
+                    if input.len() == 0 {
+                        match <#name as Router<_>>::receive(&mut storage) {
+                            // receive function success
+                            Some(_) => return Ok(vec![]),
+                            // try fallback function
+                            None => match <#name as Router<_>>::fallback(&mut storage, &input) {
+                                // fallback fuctnion success
+                                Some(res) => return res, // TODO: should we allow return value here?
+                                // let call fail in next conditional
+                                None => {},
+                            }
+                        };
+                    }
+
                     if input.len() < 4 {
                         console!("calldata too short: {}", hex::encode(input));
                         return Err(vec![]);
                     }
+
                     let selector = u32::from_be_bytes(TryInto::try_into(&input[..4]).unwrap());
-                    let mut storage = unsafe { <#name as StorageType>::new(U256::ZERO, 0) };
                     match <#name as Router<_>>::route(&mut storage, selector, &input[4..]) {
                         Some(res) => res,
                         None => {
-                            console!("unknown method selector: {selector:08x}");
-                            Err(vec![])
+                            match <#name as Router<_>>::fallback(&mut storage, &input) {
+                                Some(res) => res,
+                                None => {
+                                    console!("unknown method selector: {selector:08x}");
+                                    Err(vec![])
+                                }
+                            }
                         },
                     }
                 }
